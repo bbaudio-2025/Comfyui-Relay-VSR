@@ -21,7 +21,7 @@ with no VAE, CLIP or text encoder. There are two ways in, both pixel-space:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/<your-account>/Comfyui-Relay-VSR.git
+git clone https://github.com/bbaudio-2025/Comfyui-Relay-VSR.git
 ```
 
 Restart ComfyUI. No additional pip packages are required: the nodes only use `torch`, `safetensors`,
