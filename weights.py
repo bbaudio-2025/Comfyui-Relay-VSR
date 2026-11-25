@@ -69,7 +69,7 @@ def _quantized_weight(handle, key, device, dtype):
     module = key[: -len(".weight")]
     conf = json.loads(handle.tensor(module + ".comfy_quant").numpy().tobytes())
     if conf.get("format") != "int8_tensorwise":
-        raise ValueError(f"不支持的量化格式 {conf.get('format')!r}: {module}")
+        raise ValueError(f"Unsupported quantization format {conf.get('format')!r}: {module}")
     qdata = handle.tensor(key).to(device=device)
     scale = handle.tensor(module + ".weight_scale").to(device=device, dtype=torch.float32)
     params = get_layout_class(INT8_LAYOUT).Params(
