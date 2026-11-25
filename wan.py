@@ -112,7 +112,7 @@ class WanTransformer:
         self.temporal_window = int(config.get("temporal_context_frames", 4))
         temporal_rope = config.get("temporal_rope") or {}
         if temporal_rope.get("policy", "fixed_end") != "fixed_end":
-            raise ValueError("RelayVSR 要求 Wan 使用 fixed_end 时间 RoPE")
+            raise ValueError("RelayVSR requires Wan to use fixed_end temporal RoPE")
         self.training_frames = int(temporal_rope.get("training_frames", 8))
         # proj_out 输出是 out_channels * prod(patch_size)，这里还原每帧的通道数。
         self.out_channels = int(config.get("out_channels") or self.post["proj_w"].shape[0] // 4)
