@@ -20,6 +20,7 @@ from av.video.reformatter import Interpolation
 import comfy.utils
 import folder_paths
 
+from .profile import stage
 from .tiling import axis_alphas, axis_tiles, stitch
 
 PRESETS = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"]
@@ -93,7 +94,7 @@ class VideoReader:
         self.container = av.open(self.source, mode="r")
         if not self.container.streams.video:
             self.container.close()
-            raise ValueError("RelayVSR: 输入视频没有视频流")
+            raise ValueError("RelayVSR: input video has no video stream")
         self.stream = self.container.streams.video[0]
         self.stream.thread_type = "AUTO"
         self.fps = Fraction(self.stream.average_rate) if self.stream.average_rate else Fraction(24)
@@ -291,14 +292,14 @@ class VideoWriter:
         payload = (frames, audio)
         while self._thread.is_alive():
             if self._error is not None:
-                raise RuntimeError("RelayVSR: 视频编码失败") from self._error
+                raise RuntimeError("RelayVSR: video encoding failed") from self._error
             try:
                 self._queue.put(payload, timeout=0.2)
                 return
             except queue.Full:
                 continue
         if self._error is not None:
-            raise RuntimeError("RelayVSR: 视频编码失败") from self._error
+            raise RuntimeError("RelayVSR: video encoding failed") from self._error
 
     def finish(self):
         while self._thread.is_alive():
@@ -309,7 +310,7 @@ class VideoWriter:
                 continue
         self._thread.join()
         if self._error is not None:
-            raise RuntimeError("RelayVSR: 视频编码失败") from self._error
+            raise RuntimeError("RelayVSR: video encoding failed") from self._error
 
     def abort(self):
         self._stop = True
@@ -332,26 +333,29 @@ class VideoWriter:
                 if payload is None or self._stop:
                     break
                 frames, audio = payload
-                for frame in frames:
-                    video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
-                    if frame.shape[0] != self.height or frame.shape[1] != self.width:
-                        video_frame = video_frame.reformat(
-                            width=self.width, height=self.height, format="yuv420p",
-                            interpolation=Interpolation.LANCZOS,
-                        )
-                    else:
-                        video_frame = video_frame.reformat(format="yuv420p")
-                    self.output.mux(self.video_stream.encode(video_frame))
-                if self.audio_stream is not None:
-                    if self.audio_copy:
-                        self._mux_audio(audio)
-                    else:
-                        self.audio_samples = self._write_audio(audio, self.audio_samples)
+                # 只统计真正编码/复用的时间；queue.get() 的等待不算。
+                with stage("encode", sync=False):
+                    for frame in frames:
+                        video_frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
+                        if frame.shape[0] != self.height or frame.shape[1] != self.width:
+                            video_frame = video_frame.reformat(
+                                width=self.width, height=self.height, format="yuv420p",
+                                interpolation=Interpolation.LANCZOS,
+                            )
+                        else:
+                            video_frame = video_frame.reformat(format="yuv420p")
+                        self.output.mux(self.video_stream.encode(video_frame))
+                    if self.audio_stream is not None:
+                        if self.audio_copy:
+                            self._mux_audio(audio)
+                        else:
+                            self.audio_samples = self._write_audio(audio, self.audio_samples)
 
             if not self._stop:
-                self.output.mux(self.video_stream.encode(None))
-                if self.audio_stream is not None and not self.audio_copy:
-                    self.output.mux(self.audio_stream.encode(None))
+                with stage("encode", sync=False):
+                    self.output.mux(self.video_stream.encode(None))
+                    if self.audio_stream is not None and not self.audio_copy:
+                        self.output.mux(self.audio_stream.encode(None))
         except BaseException as error:
             self._error = error
         finally:
@@ -394,7 +398,9 @@ def _upscale_chunk(engine, frames, sr_ratio, chunk_len, seed, tiles_y, tiles_x, 
 
     outputs = []
     for offset in range(len(frames)):
-        outputs.append(stitch([tile[offset] for tile in tiles], tiles_y, tiles_x, y_alphas, x_alphas, sr_ratio))
+        with stage("stitch", sync=False):
+            stitched = stitch([tile[offset] for tile in tiles], tiles_y, tiles_x, y_alphas, x_alphas, sr_ratio)
+        outputs.append(stitched)
         for tile in tiles:
             tile[offset] = None
     return outputs
@@ -432,9 +438,10 @@ def stream_upscale(
     reader = VideoReader(video, CODECS[codec][1])
     writer = None
     try:
-        frames, audio = reader.read_chunk(chunk_len)
+        with stage("read", sync=False):
+            frames, audio = reader.read_chunk(chunk_len)
         if not frames:
-            raise ValueError("RelayVSR: 输入视频没有可解码的帧")
+            raise ValueError("RelayVSR: input video has no decodable frames")
 
         height, width = frames[0].shape[-2:]
         out_width, out_height = _output_size(width, height, sr_ratio, upscale_width)
@@ -469,7 +476,8 @@ def stream_upscale(
                     blended = previous.astype(np.float32) * (1.0 - weight) + outputs[index].astype(np.float32) * weight
                     outputs[index] = np.clip(blended, 0, 255).round().astype(np.uint8)
 
-            next_frames, next_audio = reader.read_chunk(chunk_len - overlap)
+            with stage("read", sync=False):
+                next_frames, next_audio = reader.read_chunk(chunk_len - overlap)
             if next_frames:
                 if overlap:
                     writer.write(outputs[:-overlap], audio)
