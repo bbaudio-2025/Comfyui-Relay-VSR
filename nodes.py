@@ -17,6 +17,7 @@ from comfy_api.latest import ComfyExtension, io, ui
 from typing_extensions import override
 
 from .checkpoints import inspect_bundle
+from .profile import report, reset, stage
 from .runtime import RelayVSREngine
 from .streaming import CODECS, PRESETS, stream_upscale
 
@@ -41,7 +42,7 @@ def _scan_bundles():
             try:
                 info = inspect_bundle(candidate)
             except ValueError as error:
-                logging.warning(f"RelayVSR 跳过 {candidate}: {error}")
+                logging.warning(f"RelayVSR: skipping {candidate}: {error}")
                 continue
             if info is None:
                 continue
@@ -72,10 +73,11 @@ class RelayVSRPatcher(ModelPatcher):
     release it like any other model.
     """
 
-    def __init__(self, info, dtype, offload, device):
+    def __init__(self, info, dtype, offload, attention, device):
         self.info = info
         self.relay_dtype = dtype
         self.offload = offload
+        self.attention = attention
         # Estimate before the first load; partially_load replaces it with the measured VRAM.
         size = os.path.getsize(info.wan_path) + os.path.getsize(info.flash_path)
         super().__init__(_EngineSlot(), device, mm.unet_offload_device(), size=size)
@@ -85,7 +87,7 @@ class RelayVSRPatcher(ModelPatcher):
             return 0
         cuda = device_to.type == "cuda"
         before = torch.cuda.memory_allocated(device_to) if cuda else 0
-        engine = RelayVSREngine(self.info, self.relay_dtype, self.offload, device_to)
+        engine = RelayVSREngine(self.info, self.relay_dtype, self.offload, device_to, self.attention)
         try:
             engine.load()
         except Exception:
@@ -114,8 +116,8 @@ class RelayVSRPatcher(ModelPatcher):
 class RelayVSRModel:
     """加载器输出：持有权重路径，首次超分时才把权重搬进显存。"""
 
-    def __init__(self, info, dtype, offload):
-        self.patcher = RelayVSRPatcher(info, dtype, offload, mm.get_torch_device())
+    def __init__(self, info, dtype, offload, attention):
+        self.patcher = RelayVSRPatcher(info, dtype, offload, attention, mm.get_torch_device())
 
     def ensure_loaded(self):
         mm.load_models_gpu([self.patcher])
@@ -165,6 +167,12 @@ class RelayVSRModelLoader(io.ComfyNode):
                     label_off="Keep all in VRAM",
                     tooltip="Move Wan blocks to the GPU one at a time. Enabled by default; disable it on 32 GB+ cards for faster reference passes",
                 ),
+                io.Combo.Input(
+                    "attention",
+                    options=["sdpa", "comfy"],
+                    default="sdpa",
+                    tooltip="sdpa: built-in PyTorch attention. comfy: reuse ComfyUI's fast kernel (needs --use-sage-attention / --use-flash-attention / --use-ck-attention); automatically falls back to sdpa when unavailable",
+                ),
                 io.String.Input(
                     "path",
                     default="",
@@ -176,21 +184,22 @@ class RelayVSRModelLoader(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, bundle, dtype, offload, path):
+    def execute(cls, bundle, dtype, offload, attention, path):
         global _current_model
         path = (path or "").strip()
         if path:
             info = inspect_bundle(Path(path))
             if info is None:
-                raise ValueError(f"目录中没有配对的 RelayVSR Wan/Flash 权重: {path}")
+                raise ValueError(f"No matched RelayVSR Wan/Flash weights in: {path}")
         else:
             info = BUNDLES.get(bundle) or _scan_bundles().get(bundle)
             if info is None:
                 raise ValueError(
-                    f"未找到 RelayVSR 权重，请把 wan/flash 权重放进 {os.path.join(folder_paths.models_dir, MODEL_DIR)}"
+                    f"RelayVSR weights not found; put the wan/flash weights under "
+                    f"{os.path.join(folder_paths.models_dir, MODEL_DIR)}"
                 )
         _release_current()
-        _current_model = RelayVSRModel(info, dtype, offload)
+        _current_model = RelayVSRModel(info, dtype, offload, attention)
         return io.NodeOutput(_current_model)
 
 
@@ -235,14 +244,22 @@ class RelayVSRUpscale(io.ComfyNode):
 
     @classmethod
     def execute(cls, model, images, sr_ratio, chunk_len, seed):
-        engine = model.ensure_loaded()
-        frames = _images_to_frames(images)
-        progress = comfy.utils.ProgressBar(len(frames))
+        reset()
         outputs = []
-        for pixel in engine.restore(frames, seed, sr_ratio, chunk_len, mm.throw_exception_if_processing_interrupted):
-            outputs.append(pixel)
-            progress.update(1)
-        return io.NodeOutput(_frames_to_images(outputs))
+        try:
+            with stage("load"):
+                engine = model.ensure_loaded()
+            with stage("io"):
+                frames = _images_to_frames(images)
+            progress = comfy.utils.ProgressBar(len(frames))
+            for pixel in engine.restore(frames, seed, sr_ratio, chunk_len, mm.throw_exception_if_processing_interrupted):
+                outputs.append(pixel)
+                progress.update(1)
+            with stage("io"):
+                result = _frames_to_images(outputs)
+        finally:
+            report("RelayVSR Upscale", len(outputs))
+        return io.NodeOutput(result)
 
 
 class RelayVSRUpscaleStreaming(io.ComfyNode):
@@ -363,12 +380,17 @@ class RelayVSRUpscaleStreaming(io.ComfyNode):
         cls, model, video, upscale_width, sr_ratio, chunk_len, seed, chunk_overlap,
         spatial_grid_cols, spatial_grid_rows, spatial_overlap, codec, crf, preset, filename_prefix,
     ):
-        engine = model.ensure_loaded()
-        out_path, file_name, subfolder = stream_upscale(
-            engine, video, upscale_width, sr_ratio, chunk_len, seed, chunk_overlap,
-            spatial_grid_cols, spatial_grid_rows, spatial_overlap, codec, crf, preset, filename_prefix,
-            mm.throw_exception_if_processing_interrupted,
-        )
+        reset()
+        try:
+            with stage("load"):
+                engine = model.ensure_loaded()
+            out_path, file_name, subfolder = stream_upscale(
+                engine, video, upscale_width, sr_ratio, chunk_len, seed, chunk_overlap,
+                spatial_grid_cols, spatial_grid_rows, spatial_overlap, codec, crf, preset, filename_prefix,
+                mm.throw_exception_if_processing_interrupted,
+            )
+        finally:
+            report("RelayVSR Upscale Streaming")
         return io.NodeOutput(
             out_path,
             ui=ui.PreviewVideo([ui.SavedResult(file_name, subfolder, io.FolderType.output)]),
