@@ -61,7 +61,7 @@ class RotaryEmbedding:
         if self.wan and (
             max(height, width) > self.max_length or min(positions) < 0 or max(positions) >= self.max_length
         ):
-            raise ValueError("RelayVSR 的空间或时间位置超出了权重的 RoPE 范围")
+            raise ValueError("RelayVSR spatial or temporal position exceeds the weight's RoPE range")
         frames = len(positions)
         coordinates = (
             torch.tensor(positions, device=self.device).view(frames, 1, 1).expand(frames, height, width).reshape(-1),
