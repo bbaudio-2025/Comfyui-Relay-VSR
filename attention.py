@@ -1,7 +1,8 @@
-"""RelayVSR 的矩形窗口局部注意力（PyTorch SDPA 后端）。
+"""RelayVSR 的矩形窗口局部注意力。
 
-官方实现按 16x16 查询块把 K/V 邻域 gather 成连续张量再做带掩码的 SDPA。
-这里保持同一几何定义，仅使用 torch SDPA，不依赖 Triton。
+官方实现按 16x16 查询块把 K/V 邻域 gather 成连续张量再做带掩码的注意力。
+这里保持同一几何定义：默认使用 torch SDPA；也可选用 ComfyUI 的注意力后端
+（sage / flash / comfy-kitchen），不可用时自动回退到 SDPA。
 
 shifted=False（Flash 模型）：窗口以每个 query 为中心，key 落在
     [qy - wh/2, qy - wh/2 + wh) × [qx - ww/2, qx - ww/2 + ww)。
@@ -13,9 +14,12 @@ shifted=True（Wan 主干）：窗口贴着图像边界内移，
 # Modifications: adapted for this ComfyUI plugin.
 
 from collections import OrderedDict
+import logging
 
 import torch
 import torch.nn.functional as F
+
+from .profile import stage
 
 _TILE = 16
 _CACHE_BYTES = 1 << 30
@@ -23,6 +27,75 @@ _GATHER_BYTES = 1 << 30
 
 _layouts = OrderedDict()
 _layout_bytes = 0
+
+# 注意力后端：默认 sdpa；"comfy" 表示转调 ComfyUI 的快速注意力核。
+_BACKEND = "sdpa"
+_COMFY_ATTENTION = None
+_BACKEND_FAILED = False
+_FAST_BACKENDS = ("attention_sage", "attention3_sage", "attention_flash", "attention_comfy_kitchen_int8")
+
+
+def set_backend(name):
+    """选择注意力后端，返回实际生效的 ComfyUI 核名称（sdpa 时返回 None）。
+
+    ComfyUI 默认的 optimized_attention 是 attention_sub_quad/split，比 SDPA 慢，
+    因此只有检测到 sage/flash/comfy-kitchen 时才真正启用，否则回退到 SDPA。
+    """
+    global _BACKEND, _COMFY_ATTENTION, _BACKEND_FAILED
+    name = (name or "sdpa").lower()
+    if name not in ("sdpa", "comfy"):
+        raise ValueError(f"Unsupported attention backend: {name}")
+    _BACKEND = name
+    _BACKEND_FAILED = False
+    _COMFY_ATTENTION = None
+    if name == "sdpa":
+        return None
+
+    try:
+        from comfy.ldm.modules.attention import optimized_attention
+    except Exception as error:
+        logging.warning(f"RelayVSR: cannot import ComfyUI attention backend, falling back to SDPA: {error}")
+        _BACKEND = "sdpa"
+        return None
+
+    kernel = getattr(optimized_attention, "__name__", "")
+    if kernel not in _FAST_BACKENDS:
+        logging.warning(
+            f"RelayVSR: ComfyUI attention kernel is {kernel or 'unknown'}, not sage/flash/comfy-kitchen; "
+            "falling back to SDPA. Start ComfyUI with --use-sage-attention or --use-flash-attention to enable it."
+        )
+        _BACKEND = "sdpa"
+        return None
+
+    _COMFY_ATTENTION = optimized_attention
+    logging.info(f"RelayVSR: using ComfyUI attention backend {kernel}")
+    return kernel
+
+
+def attention_backend():
+    """当前生效的后端名称。"""
+    return _BACKEND
+
+
+def _attend(q, k, v, mask=None):
+    """统一注意力入口；ComfyUI 后端调用失败时永久回退到 SDPA。"""
+    global _BACKEND_FAILED
+    if _BACKEND == "comfy" and not _BACKEND_FAILED:
+        try:
+            return _COMFY_ATTENTION(
+                q,
+                k,
+                v,
+                q.shape[1],
+                mask=mask,
+                skip_reshape=True,
+                skip_output_reshape=True,
+                enable_gqa=q.shape[1] != k.shape[1],
+            )
+        except Exception as error:
+            _BACKEND_FAILED = True
+            logging.warning(f"RelayVSR: ComfyUI attention call failed, falling back to SDPA from now on: {error}")
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=q.shape[1] != k.shape[1])
 
 
 def clear_layout_cache():
@@ -102,6 +175,11 @@ def _layout(height, width, windows, shifted, chunk, device):
 
 def local_attention(query, key, value, height, width, windows, shifted):
     """query: (B, heads, H*W, dim)；key/value: (B, kv_heads, len(windows)*H*W, dim)。"""
+    with stage("attention_local"):
+        return _local_attention(query, key, value, height, width, windows, shifted)
+
+
+def _local_attention(query, key, value, height, width, windows, shifted):
     b, heads, tokens, dim = query.shape
     kv_heads = key.shape[1]
     n = height * width
@@ -113,9 +191,9 @@ def local_attention(query, key, value, height, width, windows, shifted):
         or key.shape[3] != dim
         or heads % kv_heads
     ):
-        raise ValueError("RelayVSR 局部注意力的 Q/K/V 形状不匹配")
+        raise ValueError("RelayVSR local attention Q/K/V shape mismatch")
     if query.dtype != key.dtype or key.dtype != value.dtype:
-        raise ValueError("RelayVSR 局部注意力的 Q/K/V 必须使用相同 dtype")
+        raise ValueError("RelayVSR local attention requires Q/K/V in the same dtype")
 
     lengths = [
         (min(height, wh + _TILE - 1) * min(width, ww + _TILE - 1) if shifted else (wh + _TILE - 1) * (ww + _TILE - 1))
@@ -133,9 +211,7 @@ def local_attention(query, key, value, height, width, windows, shifted):
             q = qs.index_select(0, qi).view(count, _TILE * _TILE, heads, dim).transpose(1, 2)
             k = ks.index_select(0, ki).view(count, key_length, kv_heads, dim).transpose(1, 2)
             v = vs.index_select(0, ki).view(count, key_length, kv_heads, dim).transpose(1, 2)
-            attended = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=mask, enable_gqa=heads != kv_heads
-            )
+            attended = _attend(q, k, v, mask)
             attended = attended.transpose(1, 2).reshape(-1, heads, dim)
             if owner is not None:
                 attended = attended.index_select(0, owner)
@@ -145,10 +221,15 @@ def local_attention(query, key, value, height, width, windows, shifted):
 
 def full_attention(query, key, value):
     """无掩码整段注意力：query (tokens, heads, dim)，key/value (len, kv_heads, dim)。"""
+    with stage("attention_full"):
+        return _full_attention(query, key, value)
+
+
+def _full_attention(query, key, value):
     q = query.transpose(0, 1).unsqueeze(0)
     k = key.transpose(0, 1).unsqueeze(0)
     v = value.transpose(0, 1).unsqueeze(0)
-    out = F.scaled_dot_product_attention(q, k, v, enable_gqa=query.shape[1] != key.shape[1])
+    out = _attend(q, k, v)
     return out[0].transpose(0, 1).flatten(1)
 
 
