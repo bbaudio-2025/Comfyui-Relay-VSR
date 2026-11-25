@@ -16,7 +16,7 @@ class RelayVSRGeometry:
 
     def __post_init__(self):
         if self.scale not in (2, 4):
-            raise ValueError("RelayVSR 原生倍率必须是 2 或 4")
+            raise ValueError("RelayVSR native scale must be 2 or 4")
 
     @property
     def latent_stride(self):
@@ -44,10 +44,10 @@ class RelayVSRGeometry:
     def output_size(self, sr_ratio, height, width):
         if self.scale == 2:
             if sr_ratio != 2:
-                raise ValueError("RelayVSR x2 权重仅支持 2 倍放大")
+                raise ValueError("RelayVSR x2 weights only support a 2x upscale")
         elif sr_ratio not in (2, 4):
-            raise ValueError("RelayVSR x4 权重的 sr_ratio 必须为 2 或 4")
+            raise ValueError("RelayVSR x4 weights require sr_ratio 2 or 4")
         target = (int(height * sr_ratio), int(width * sr_ratio))
         if min(target) <= 0:
-            raise ValueError("RelayVSR 输出尺寸必须为正")
+            raise ValueError("RelayVSR output size must be positive")
         return target
