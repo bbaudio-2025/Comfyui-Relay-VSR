@@ -21,7 +21,7 @@ with no VAE, CLIP or text encoder. There are two ways in, both pixel-space:
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/bbaudio-2025/Comfyui-Relay-VSR.git
+git clone https://github.com/<your-account>/Comfyui-Relay-VSR.git
 ```
 
 Restart ComfyUI. No additional pip packages are required: the nodes only use `torch`, `safetensors`,
@@ -61,9 +61,16 @@ custom path field).
 | `bundle` | Directory under `models/relayvsr` containing a matched Wan/Flash pair |
 | `dtype` | `bf16` (default) or `fp16` for the floating-point weights |
 | `offload` | Move Wan blocks to the GPU one at a time. Enabled by default; disable it on 32 GB+ cards for faster reference passes |
+| `attention` | `sdpa` (default) or `comfy`. `comfy` reuses ComfyUI's fast attention kernel (SageAttention / FlashAttention / comfy-kitchen) and silently falls back to SDPA when no fast kernel is active |
 | `path` | Advanced: absolute path to a weight directory, overrides `bundle` |
 
 Output: `RELAYVSR_MODEL` (connect to the upscale node).
+
+> `attention=comfy` only takes effect when ComfyUI itself runs a fast attention kernel. Start it with
+> `--use-sage-attention`, `--use-flash-attention` or `--use-ck-attention`; otherwise ComfyUI's
+> `optimized_attention` is `attention_sub_quad` / `attention_split`, which is slower than SDPA, so the
+> plugin detects this and keeps using SDPA. If the fast kernel rejects the window mask at runtime, the
+> plugin logs a warning and falls back to SDPA for the rest of the run.
 
 ### RelayVSR Upscale — category `image/upscaling`
 
@@ -123,6 +130,30 @@ re-seeking, so `chunk_overlap` costs model time but no extra decode.
 When `upscale_width` is non-zero, the stitched frames are resized to that width (with the height
 derived from the source aspect ratio, both rounded to even) using Lanczos in the encoder thread. This
 allows a fixed delivery size such as 1920 regardless of the model's native 2× or 4× output.
+
+## Profiling
+
+Both upscale nodes print one timing summary when they finish, so even a long streaming run
+only logs once instead of once per frame:
+
+```
+RelayVSR Upscale Streaming: total 128.42 s
+  Flash trunk: 96.10 s (74.8%), 513 calls
+  |_ Local attention: 88.02 s (68.5%), 6156 calls
+  Wan reference frames: 9.24 s (7.2%), 33 calls
+  Flash pixel decode: 10.81 s (8.4%), 513 calls
+  Video encode (thread): 7.51 s (5.8%), 21 calls
+  Postprocess (interp/uint8/CPU copy): 4.03 s (3.1%), 513 calls
+  Video decode: 1.20 s (0.9%), 22 calls
+  Other (setup/scheduling/wait): -0.27 s
+```
+
+Every stage is timed with `perf_counter` plus a CUDA synchronize on both ends, so the
+numbers are device time instead of kernel launch time. `Local attention` and `Full
+attention` are nested inside `Wan reference frames` / `Flash trunk` and therefore are not
+added to `Other`. The encoder runs in a background thread and overlaps the GPU work, so
+its share can push the sum above 100%. For `RelayVSR Upscale` the final video encode
+happens in ComfyUI's own save node and is not counted here.
 
 ## INT8 conv-rotation weights
 
