@@ -50,7 +50,7 @@ def _quantizable(name):
 
 def _quantize(tensor, name, device):
     if tensor.shape[-1] % GROUP_SIZE:
-        raise ValueError(f"{name} 的输入维度 {tensor.shape[-1]} 不能被 {GROUP_SIZE} 整除")
+        raise ValueError(f"{name} input dim {tensor.shape[-1]} is not divisible by {GROUP_SIZE}")
     qdata, params = TensorWiseINT8Layout.quantize(
         tensor.to(device),
         is_weight=True,
@@ -71,7 +71,7 @@ def convert(src, dst, device="cuda"):
     src, dst = Path(src), Path(dst)
     wan_path = src / WAN_NAME
     if not wan_path.is_file():
-        raise FileNotFoundError(f"找不到 {wan_path}")
+        raise FileNotFoundError(f"Cannot find {wan_path}")
     dst.mkdir(parents=True, exist_ok=True)
 
     started = time.time()
@@ -87,7 +87,7 @@ def convert(src, dst, device="cuda"):
             else:
                 output[name] = handle.get_tensor(name)
             if index % 25 == 0 or index == len(names):
-                print(f"\r读取 {index}/{len(names)}，已量化 {quantized} 个权重", end="", flush=True)
+                print(f"\rRead {index}/{len(names)}, quantized {quantized} weights", end="", flush=True)
         print()
 
     out_path = dst / OUTPUT_NAME
@@ -99,21 +99,21 @@ def convert(src, dst, device="cuda"):
         shutil.copy2(flash_src, dst / FLASH_NAME)
 
     size = out_path.stat().st_size / 2**30
-    print(f"完成：{out_path}（{size:.2f} GiB，{quantized} 个 int8 convrot 权重）")
-    print(f"耗时 {time.time() - started:.1f} 秒")
+    print(f"Done: {out_path} ({size:.2f} GiB, {quantized} int8 convrot weights)")
+    print(f"Took {time.time() - started:.1f} s")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RelayVSR Wan 主干 int8 convrot 转换")
-    parser.add_argument("src", help="包含 wan_x2.safetensors 的原始目录")
-    parser.add_argument("dst", nargs="?", help="输出目录，默认 <src>_int8_convrot")
-    parser.add_argument("--device", default="cuda", help="量化设备，默认 cuda")
+    parser = argparse.ArgumentParser(description="Convert the RelayVSR Wan backbone to int8 convrot")
+    parser.add_argument("src", help="Source directory containing wan_x2.safetensors")
+    parser.add_argument("dst", nargs="?", help="Output directory, defaults to <src>_int8_convrot")
+    parser.add_argument("--device", default="cuda", help="Quantization device, defaults to cuda")
     options = parser.parse_args()
 
     src = Path(options.src).resolve()
     dst = Path(options.dst).resolve() if options.dst else src.with_name(src.name + "_int8_convrot")
     if torch.device(options.device).type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("量化需要 CUDA 设备，请检查 PyTorch 安装")
+        raise RuntimeError("Quantization needs a CUDA device; check your PyTorch install")
     convert(src, dst, options.device)
 
 
