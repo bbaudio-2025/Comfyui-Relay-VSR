@@ -18,10 +18,11 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-from .attention import clear_layout_cache
+from .attention import clear_layout_cache, set_backend
 from .checkpoints import checkpoint_config, validate_configs
 from .flash import FlashKV, FlashPre, FlashTransformer
 from .geometry import RelayVSRGeometry
+from .profile import stage
 from .rope import RotaryEmbedding
 from .wan import WanKV, WanPre, WanTransformer
 from .weights import (
@@ -53,18 +54,22 @@ class RunState:
 
 
 class RelayVSREngine:
-    def __init__(self, bundle, dtype="bf16", offload=False, device=None):
+    def __init__(self, bundle, dtype="bf16", offload=False, device=None, attention="sdpa"):
         self.bundle = bundle
         self.geometry = RelayVSRGeometry(bundle.scale)
         self.dtype = DTYPES.get(dtype)
         if self.dtype is None:
-            raise ValueError(f"不支持的 dtype: {dtype}")
+            raise ValueError(f"Unsupported dtype: {dtype}")
         self.device = device or torch.device("cuda")
         self.offload = bool(offload)
+        self.attention = attention
         self.loaded = False
 
     # ---------------------------------------------------------------- 装配
     def load(self):
+        # 先确定注意力后端（不可用时 set_backend 会自动回退到 SDPA）
+        set_backend(self.attention)
+
         wan_config = checkpoint_config(self.bundle.wan_path, "wan", self.geometry.scale)
         flash_config = checkpoint_config(self.bundle.flash_path, "flash", self.geometry.scale)
         validate_configs(wan_config, flash_config, self.geometry.scale)
@@ -218,40 +223,51 @@ class RelayVSREngine:
         iterator = iter(frames)
         first = next(iterator, None)
         if first is None:
-            raise ValueError("RelayVSR 输入为空")
+            raise ValueError("RelayVSR input is empty")
         height, width = first.shape[-2:]
         padded_height, padded_width = self.geometry.padded_size(height, width)
         target = self.geometry.output_size(sr_ratio, height, width)
         state = self._init_run(padded_height, padded_width, seed)
         scale = self.geometry.scale
         try:
-            start_condition = self._reference(first, state)
+            with stage("wan"):
+                start_condition = self._reference(first, state)
             first_window = True
             start = first
             while True:
                 window = [start, *islice(iterator, chunk_len - 1)]
                 if any(frame.shape != first.shape for frame in window):
-                    raise ValueError("RelayVSR 要求所有输入帧尺寸一致")
+                    raise ValueError("RelayVSR requires all input frames to have the same size")
                 if len(window) == 1 and not first_window:
                     return
                 check()
-                end_condition = self._reference(window[-1], state) if len(window) > 1 else start_condition
+                if len(window) > 1:
+                    with stage("wan"):
+                        end_condition = self._reference(window[-1], state)
+                else:
+                    end_condition = start_condition
                 conditions = [
                     (torch.cat((a[0], b[0]), 0), torch.cat((a[1], b[1]), 0))
                     for a, b in zip(start_condition, end_condition)
                 ]
                 for offset, frame in enumerate(window):
                     check()
-                    lr = self._preprocess(frame)
-                    hidden = self.flash_pre.frame(lr)
-                    hidden = self.flash.infer(
-                        hidden, conditions, state.flash_kv, offset, lr.shape[-2] // self.geometry.latent_stride,
-                        lr.shape[-1] // self.geometry.latent_stride,
-                    )
-                    prediction = self.flash.decode(hidden, lr)
-                    prediction = prediction[..., : height * scale, : width * scale]
+                    with stage("preprocess"):
+                        lr = self._preprocess(frame)
+                    with stage("flash"):
+                        hidden = self.flash_pre.frame(lr)
+                        hidden = self.flash.infer(
+                            hidden, conditions, state.flash_kv, offset, lr.shape[-2] // self.geometry.latent_stride,
+                            lr.shape[-1] // self.geometry.latent_stride,
+                        )
+                    with stage("decode"):
+                        prediction = self.flash.decode(hidden, lr)
+                        prediction = prediction[..., : height * scale, : width * scale]
                     if first_window or offset > 0:
-                        yield self._postprocess(prediction, target)
+                        # yield 放在计时块外，避免把下游消费时间算进后处理。
+                        with stage("postprocess"):
+                            pixel = self._postprocess(prediction, target)
+                        yield pixel
                 first_window = False
                 start, start_condition = window[-1], end_condition
                 if len(window) < chunk_len:
